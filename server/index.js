@@ -2,170 +2,156 @@ const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const app = express();
-
+ 
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
-
-// ── Sector ETFs to track ─────────────────────────────────────────
+ 
+const FINNHUB_KEY = process.env.FINNHUB_KEY || 'd8372opr01qjsh1kf0j0d8372opr01qjsh1kf0jg';
+const REFRESH_MS  = 38000;
+ 
 const SECTORS = [
-  { ticker: 'XLK', name: 'Technology' },
-  { ticker: 'XLF', name: 'Financials' },
-  { ticker: 'XLV', name: 'Health Care' },
-  { ticker: 'XLI', name: 'Industrials' },
-  { ticker: 'XLE', name: 'Energy' },
-  { ticker: 'XLY', name: 'Cons. Disc.' },
-  { ticker: 'XLP', name: 'Cons. Staples' },
-  { ticker: 'XLU', name: 'Utilities' },
-  { ticker: 'XLB', name: 'Materials' },
-  { ticker: 'XLC', name: 'Comm. Svcs' },
-  { ticker: 'XLRE', name: 'Real Estate' },
+  { ticker: 'XLK',  name: 'Technology'    },
+  { ticker: 'XLF',  name: 'Financials'    },
+  { ticker: 'XLV',  name: 'Health Care'   },
+  { ticker: 'XLI',  name: 'Industrials'   },
+  { ticker: 'XLE',  name: 'Energy'        },
+  { ticker: 'XLY',  name: 'Cons. Disc.'   },
+  { ticker: 'XLP',  name: 'Cons. Staples' },
+  { ticker: 'XLU',  name: 'Utilities'     },
+  { ticker: 'XLB',  name: 'Materials'     },
+  { ticker: 'XLC',  name: 'Comm. Svcs'    },
+  { ticker: 'XLRE', name: 'Real Estate'   },
 ];
-
-// ── In-memory store ───────────────────────────────────────────────
-let sectorData = {};
-let hourlyLog = [];
-let lastFetch = null;
+ 
+let sectorData  = {};
+let hourlyLog   = [];
+let lastFetch   = null;
 let fetchStatus = 'pending';
-
-// ── Fetch a single ticker from Yahoo Finance ──────────────────────
-function fetchYahoo(ticker) {
+ 
+function fetchQuote(ticker) {
   return new Promise((resolve, reject) => {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1h&range=1mo&includePrePost=false`;
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-      }
-    };
-    https.get(url, options, (res) => {
+    const url = `https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_KEY}`;
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const q = JSON.parse(data);
+          if (!q.c || q.c === 0) return reject(new Error(`No quote for ${ticker}`));
+          const change1h = ((q.c - q.o) / q.o) * 100;
+          const change1d = ((q.c - q.pc) / q.pc) * 100;
+          resolve({
+            ticker,
+            price:     Math.round(q.c  * 100) / 100,
+            change1h:  Math.round(change1h * 100) / 100,
+            change1d:  Math.round(change1d * 100) / 100,
+            change1m:  sectorData[ticker]?.change1m || 0,
+            high:      Math.round(q.h  * 100) / 100,
+            low:       Math.round(q.l  * 100) / 100,
+            prevClose: Math.round(q.pc * 100) / 100,
+            timestamp: new Date().toISOString(),
+          });
+        } catch(e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
+ 
+function fetch1mChange(ticker) {
+  return new Promise((resolve) => {
+    const to   = Math.floor(Date.now() / 1000);
+    const from = to - 60 * 60 * 24 * 30;
+    const url  = `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
+    https.get(url, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
           const json = JSON.parse(data);
-          const result = json?.chart?.result?.[0];
-          if (!result) return reject(new Error(`No data for ${ticker}`));
-
-          const quotes = result.indicators?.quote?.[0];
-          const closes = quotes?.close || [];
-          const timestamps = result.timestamp || [];
-
-          // Filter out null values
-          const valid = closes.map((c, i) => ({ c, t: timestamps[i] })).filter(x => x.c != null);
-          if (valid.length < 2) return reject(new Error(`Not enough data for ${ticker}`));
-
-          const current = valid[valid.length - 1].c;
-          const prev1h  = valid[valid.length - 2]?.c || current;
-          const prev1d  = valid[Math.max(0, valid.length - 7)]?.c || current;  // ~6.5 trading hours
-          const prev1m  = valid[0]?.c || current;
-
-          const change1h = ((current - prev1h) / prev1h) * 100;
-          const change1d = ((current - prev1d) / prev1d) * 100;
-          const change1m = ((current - prev1m) / prev1m) * 100;
-
-          resolve({
-            ticker,
-            price: Math.round(current * 100) / 100,
-            change1h: Math.round(change1h * 100) / 100,
-            change1d: Math.round(change1d * 100) / 100,
-            change1m: Math.round(change1m * 100) / 100,
-            timestamp: new Date().toISOString(),
-          });
-        } catch (e) {
-          reject(e);
-        }
+          if (json.s !== 'ok' || !json.c || json.c.length < 2) return resolve(0);
+          const first   = json.c[0];
+          const current = json.c[json.c.length - 1];
+          resolve(Math.round(((current - first) / first) * 10000) / 100);
+        } catch { resolve(0); }
       });
-    }).on('error', reject);
+    }).on('error', () => resolve(0));
   });
 }
-
-// ── Fetch all 11 sectors ──────────────────────────────────────────
+ 
+let fetch1mDone = false;
+ 
 async function fetchAllSectors() {
-  console.log(`[${new Date().toISOString()}] Fetching all sectors from Yahoo Finance...`);
+  console.log(`[${new Date().toISOString()}] Fetching sectors from Finnhub...`);
   fetchStatus = 'fetching';
   const results = [];
-
+ 
   for (const s of SECTORS) {
     try {
-      const data = await fetchYahoo(s.ticker);
-      sectorData[s.ticker] = data;
-      results.push(data);
-      console.log(`  ✓ ${s.ticker}: ${data.price} (1h: ${data.change1h}%)`);
-      // Small delay between requests to be polite
-      await new Promise(r => setTimeout(r, 300));
-    } catch (e) {
+      const quote = await fetchQuote(s.ticker);
+      // Only fetch 1M change on first run to save API calls
+      if (!fetch1mDone) {
+        quote.change1m = await fetch1mChange(s.ticker);
+        await new Promise(r => setTimeout(r, 250));
+      }
+      sectorData[s.ticker] = quote;
+      results.push(quote);
+      console.log(`  ✓ ${s.ticker}: $${quote.price} 1H:${quote.change1h}% 1D:${quote.change1d}%`);
+      await new Promise(r => setTimeout(r, 150));
+    } catch(e) {
       console.error(`  ✗ ${s.ticker}: ${e.message}`);
     }
   }
-
+ 
+  if (!fetch1mDone && results.length > 0) fetch1mDone = true;
+ 
   if (results.length > 0) {
-    // Save hourly snapshot
-    const snapshot = {
-      time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-      timestamp: new Date().toISOString(),
-      sectors: results.map(r => ({ abbr: r.ticker, v: r.change1h }))
-    };
-    hourlyLog.push(snapshot);
-    if (hourlyLog.length > 48) hourlyLog = hourlyLog.slice(-48);
-
-    lastFetch = new Date().toISOString();
+    const now = new Date();
+    const lastSnap = hourlyLog[hourlyLog.length - 1];
+    const minsSince = lastSnap ? (now - new Date(lastSnap.timestamp)) / 60000 : 999;
+    if (minsSince >= 60) {
+      hourlyLog.push({
+        time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        timestamp: now.toISOString(),
+        sectors: results.map(r => ({ abbr: r.ticker, v: r.change1h }))
+      });
+      if (hourlyLog.length > 48) hourlyLog = hourlyLog.slice(-48);
+    }
+    lastFetch   = now.toISOString();
     fetchStatus = 'ok';
-    console.log(`  Done. ${results.length}/11 sectors fetched.`);
+    console.log(`  Done. ${results.length}/11 sectors live.`);
   } else {
     fetchStatus = 'error';
-    console.error('  No sectors fetched — Yahoo may be rate limiting.');
   }
 }
-
-// ── Routes ────────────────────────────────────────────────────────
+ 
 app.get('/data', (req, res) => {
-  res.json({
-    sectors: Object.values(sectorData),
-    hourlyLog,
-    lastUpdated: lastFetch || new Date().toISOString(),
-    fetchStatus,
-  });
+  res.json({ sectors: Object.values(sectorData), hourlyLog, lastUpdated: lastFetch, fetchStatus });
 });
-
+ 
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    sectors: Object.keys(sectorData).length,
-    lastFetch,
-    fetchStatus,
-    nextFetch: lastFetch
-      ? new Date(new Date(lastFetch).getTime() + 60 * 60 * 1000).toISOString()
-      : 'soon'
-  });
+  res.json({ status: 'ok', sectors: Object.keys(sectorData).length, lastFetch, fetchStatus });
 });
-
-// Manual refresh endpoint (visit /refresh in browser to force a fetch)
+ 
 app.get('/refresh', async (req, res) => {
-  res.json({ message: 'Fetching data now... check /health in 30 seconds' });
+  res.json({ message: 'Refreshing — check /health in 20s' });
+  fetch1mDone = false;
   fetchAllSectors();
 });
-
-// Still accept TradingView webhooks if you fix alerts later
+ 
 app.post('/webhook', (req, res) => {
   const { ticker, price, change1h, change1d, change1m, volume, secret } = req.body;
-  const expectedSecret = process.env.WEBHOOK_SECRET || 'changeme';
-  if (secret !== expectedSecret) return res.status(401).json({ error: 'Unauthorized' });
+  const expected = process.env.WEBHOOK_SECRET || 'changeme';
+  if (secret !== expected) return res.status(401).json({ error: 'Unauthorized' });
   if (!ticker) return res.status(400).json({ error: 'ticker required' });
-  const ts = new Date().toISOString();
-  sectorData[ticker] = { ticker, price, change1h, change1d, change1m, volume, timestamp: ts };
-  hourlyLog.push({ ...sectorData[ticker] });
-  if (hourlyLog.length > 480) hourlyLog = hourlyLog.slice(-480);
-  console.log(`[${ts}] Webhook received: ${ticker} @ ${price}`);
-  res.json({ ok: true, received: ticker });
+  sectorData[ticker] = { ticker, price, change1h, change1d, change1m, volume, timestamp: new Date().toISOString() };
+  res.json({ ok: true });
 });
-
-// ── Start server ─────────────────────────────────────────────────
+ 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`Sector tracker server running on port ${PORT}`);
-  // Fetch immediately on startup
+  console.log(`Sector tracker running on port ${PORT} — Finnhub real-time`);
   await fetchAllSectors();
-  // Then fetch every hour
-  setInterval(fetchAllSectors, 60 * 60 * 1000);
+  setInterval(fetchAllSectors, REFRESH_MS);
 });
+ 
